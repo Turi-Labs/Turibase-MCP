@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 
 def create_embeddings_for_files(directory, embeddings_path="embeddings.pkl"):
     """
-    Create embeddings for Markdown files and store them locally without LangChain.
+    Create or update embeddings for Markdown files incrementally.
+    Only processes new or modified files since last run.
 
     :param directory: Path to the directory containing files
     :param embeddings_path: Path to store the embeddings
@@ -46,11 +47,26 @@ def create_embeddings_for_files(directory, embeddings_path="embeddings.pkl"):
             start = end - chunk_overlap if end - start > chunk_overlap else end
         return chunks
 
-    all_texts = []
-    all_metadatas = []
-    all_embeddings = []
+    # Load existing embeddings if they exist
+    existing_data = {}
+    file_timestamps = {}
+    
+    if os.path.exists(embeddings_path):
+        logger.info(f"Loading existing embeddings from {embeddings_path}")
+        try:
+            with open(embeddings_path, 'rb') as f:
+                existing_data = pickle.load(f)
+            file_timestamps = existing_data.get('file_timestamps', {})
+            logger.info(f"Loaded {len(existing_data.get('texts', []))} existing text chunks")
+        except Exception as e:
+            logger.warning(f"Could not load existing embeddings: {e}. Starting fresh.")
+            existing_data = {}
 
-    # Changed to focus on Markdown files
+    # Initialize data structures
+    all_texts = existing_data.get('texts', [])
+    all_metadatas = existing_data.get('metadatas', [])
+    all_embeddings = existing_data.get('embeddings', np.array([])).tolist() if len(existing_data.get('embeddings', [])) > 0 else []
+
     supported_extensions = (".md",)
 
     # Ensure directory exists
@@ -58,22 +74,81 @@ def create_embeddings_for_files(directory, embeddings_path="embeddings.pkl"):
         logger.error(f"Directory {directory} does not exist")
         raise ValueError(f"Directory {directory} does not exist")
 
-    # Get list of files
-    files = [f for f in os.listdir(directory) if f.lower().endswith(supported_extensions)]
+    # Get current files and their modification times
+    current_files = {}
+    for root, _, filenames in os.walk(directory):
+        for filename in filenames:
+            if filename.lower().endswith(supported_extensions):
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, directory)
+                current_files[rel_path] = os.path.getmtime(full_path)
 
-    if not files:
+    if not current_files:
         logger.warning(f"No markdown files found in directory {directory}")
-        return None
+        return len(all_texts) if all_texts else 0
 
-    logger.info(f"Found {len(files)} markdown files to process")
+    # Find files that need processing (new or modified)
+    files_to_process = []
+    for rel_path, mod_time in current_files.items():
+        if rel_path not in file_timestamps or file_timestamps[rel_path] < mod_time:
+            files_to_process.append(rel_path)
 
-    for filename in tqdm(files, desc="Processing files"):
+    # Remove embeddings for files that no longer exist
+    files_to_remove = set(file_timestamps.keys()) - set(current_files.keys())
+    if files_to_remove:
+        logger.info(f"Removing embeddings for {len(files_to_remove)} deleted files")
+        # Create new lists without the removed files
+        new_texts = []
+        new_metadatas = []
+        new_embeddings = []
+        
+        for i, metadata in enumerate(all_metadatas):
+            if metadata['source'] not in files_to_remove:
+                new_texts.append(all_texts[i])
+                new_metadatas.append(all_metadatas[i])
+                new_embeddings.append(all_embeddings[i])
+        
+        all_texts = new_texts
+        all_metadatas = new_metadatas
+        all_embeddings = new_embeddings
+        
+        # Remove from timestamps
+        for file_path in files_to_remove:
+            del file_timestamps[file_path]
+
+    # Remove embeddings for modified files (they'll be re-added)
+    modified_files = [f for f in files_to_process if f in file_timestamps]
+    if modified_files:
+        logger.info(f"Updating embeddings for {len(modified_files)} modified files")
+        # Remove old embeddings for modified files
+        new_texts = []
+        new_metadatas = []
+        new_embeddings = []
+        
+        for i, metadata in enumerate(all_metadatas):
+            if metadata['source'] not in modified_files:
+                new_texts.append(all_texts[i])
+                new_metadatas.append(all_metadatas[i])
+                new_embeddings.append(all_embeddings[i])
+        
+        all_texts = new_texts
+        all_metadatas = new_metadatas
+        all_embeddings = new_embeddings
+
+    if not files_to_process:
+        logger.info("No new or modified files to process")
+        return len(all_texts)
+
+    logger.info(f"Processing {len(files_to_process)} new/modified files")
+
+    # Process new/modified files
+    for filename in tqdm(files_to_process, desc="Processing files"):
         file_path = os.path.join(directory, filename)
         try:
             # Read markdown file directly
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read()
-
+            
             if not text.strip():  # Skip empty documents
                 logger.warning(f"Skipping empty file: {filename}")
                 continue
@@ -94,13 +169,15 @@ def create_embeddings_for_files(directory, embeddings_path="embeddings.pkl"):
                     all_texts.append(chunk)
                     all_embeddings.append(embedding)
 
+            # Update timestamp
+            file_timestamps[filename] = current_files[filename]
             logger.info(f"Successfully processed {filename}")
 
         except Exception as e:
             logger.error(f"Error processing {filename}: {str(e)}")
             continue
 
-    # Check if we have any valid texts before creating the index
+    # Check if we have any valid texts
     if not all_texts:
         logger.error("No valid text chunks were extracted from the documents")
         raise ValueError("No valid text chunks were extracted from the documents")
@@ -120,7 +197,8 @@ def create_embeddings_for_files(directory, embeddings_path="embeddings.pkl"):
         "texts": all_texts,
         "metadatas": all_metadatas,
         "embeddings": embeddings_array,
-        "index": faiss.serialize_index(index)
+        "index": faiss.serialize_index(index),
+        "file_timestamps": file_timestamps  # Store file modification times
     }
 
     # Ensure the directory for embeddings exists
@@ -133,4 +211,9 @@ def create_embeddings_for_files(directory, embeddings_path="embeddings.pkl"):
     logger.info("Embeddings saved successfully!")
     return len(all_texts)
 
-# create_embeddings_for_files("knowledgebase/2025-05-20")
+
+
+# todo: Currently the code can create a new embedding file. but i want to add a function to update the existing embedding file.
+
+
+create_embeddings_for_files("knowledgebase")
