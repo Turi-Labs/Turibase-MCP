@@ -80,4 +80,4 @@ def rag_base(question: str, embeddings_path: str) -> str:
     except Exception as e:
         return f"An error occurred: {str(e)}"
     
-# print(rag_base("is there an language model which runs on diffusion?", "embeddings.pkl"))
+print(rag_base("i want to knoww about red teaming and llm. provide some projects or links to learn more", "embeddings.pkl"))
